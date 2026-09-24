@@ -11,6 +11,7 @@
 - **设备指标校准**：按设备 + 指标维护线性校准配置（`校准值 = 原始值 × scale + offset`），有效时间段互不重叠（事务内校验），按时刻解析唯一生效配置并计算校准值，不改写已存原始测量；窗口聚合支持可选的校准值模式（`calibrated=true`），按每个已提交包的 `sent_at` 解析当时生效的校准区间计算统计值，无配置沿用原始值。
 - **只读归档导出**：按设备 + seq 范围创建一次性导出任务，返回 NDJSON 分页游标与 manifest（包数、首尾序号、规范化内容 SHA-256），快照不可变、续传字节稳定，并提供摘要校验接口；导出不触碰提交、缓冲、重复与告警数据。
 - **双设备并行测量比对**：交接班时按设备、指标、UTC 时间段、最大时间偏差与允许数值偏差，只读比对参考仪器与待检仪器已提交包中的同指标读数；测量时间优先取 `ts`、否则取包 `sent_at`，保序一对一配对（先最大化配对数、再最小化时间差总和、平局按配对序号字典序决胜），返回逐对读数差与是否超差及两侧未配对汇总；不改写原始包、缓冲与告警。
+- **双指标配比验收**：为设备保存分子指标、分母指标、各自单位、合格比例上下限（闭区间）与最低有效组数（要求两种指标不同、下限不大于上限）；按设备 + 序号闭区间查询验收，只读已提交包，在每个包内按两种指标各自出现顺序一对一配组、禁止跨包，缺对应读数 / 单位不符 / 分母为零的组标无效并给出原因，有效组比例落入闭区间才合格；整体须达到最低有效组数且所有有效组合格，返回逐组序号、包内位置、比例与结论；缓冲包与作废序号不参与计算。
 
 ## 快速开始
 
@@ -21,7 +22,7 @@ docker compose up --build
 ```
 
 这一条命令完成全部初始化：构建镜像 → 容器内安装依赖（`docker-entrypoint.sh`）→
-应用启动钩子自动创建 SQLite 数据库与全部表结构（含告警规则、规则状态、告警事件、校准配置表）→ 启动服务。
+应用启动钩子自动创建 SQLite 数据库与全部表结构（含告警规则、规则状态、告警事件、校准配置、双指标配比验收配置表）→ 启动服务。
 数据库文件持久化在命名卷 `lab-data`（容器内 `/data/lab.db`），重启不丢规则与事件。
 
 服务地址：http://localhost:8000 ，交互式文档：http://localhost:8000/docs
@@ -104,6 +105,10 @@ pytest tests/
 | GET | `/api/v1/exports/{id}/pages?cursor=` | NDJSON 分页续传（响应头返回下一个游标） |
 | POST | `/api/v1/exports/{id}/verify` | 提交导出内容 SHA-256 校验完整性 |
 | GET | `/api/v1/comparisons` | 双设备同指标并行测量比对（交接班核对参考 / 待检仪器读数） |
+| POST | `/api/v1/ratio-acceptance/configs` | 保存双指标配比验收配置（分子 / 分母指标、单位、比例上下限、最低有效组数） |
+| GET | `/api/v1/ratio-acceptance/configs` | 验收配置列表（可按 `device_id` 过滤） |
+| GET | `/api/v1/ratio-acceptance/configs/{id}` | 验收配置详情 |
+| GET | `/api/v1/devices/{id}/ratio-acceptance/evaluate` | 按设备 + 序号闭区间执行双指标配比验收（只读已提交包） |
 
 ## 窗口聚合（Rollup）
 
@@ -585,6 +590,127 @@ curl 'localhost:8000/api/v1/comparisons?reference_device=ph-ref-01&target_device
 #       "time_delta_seconds":2.0,"abs_value_diff":0.3,"exceeded":false}, ...]}
 ```
 
+## 双指标配比验收（Ratio Acceptance）
+
+某些验收场景需要核对同一台设备上报的**两种指标读数的比例**（例如污染物质量与
+排气流量之比）。先为设备保存一套配比验收配置，再按**序号闭区间**查询该区间内
+已提交包的配组与逐组结论。接口是**纯只读**的：只读 `committed` 表，不写入、
+不改写任何测量数据，缓冲、作废、告警与校准均不受影响。
+
+### 保存配置
+
+`POST /api/v1/ratio-acceptance/configs`
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `device_id` | 是 | 设备号（不要求设备已上报过包，可先配置后上报） |
+| `numerator_metric` / `denominator_metric` | 是 | 分子 / 分母指标名，**二者必须不同** |
+| `numerator_unit` / `denominator_unit` | 是 | 分子 / 分母读数要求的单位（非空字符串）；读数单位与之不符的组无效 |
+| `ratio_lower_limit` / `ratio_upper_limit` | 是 | 合格比例闭区间 `[下限, 上限]`，要求 **下限 ≤ 上限** |
+| `min_valid_groups` | 否 | 整体验收通过所需的最低有效组数，默认 `1`，必须 ≥ 1 |
+
+```bash
+curl -X POST localhost:8000/api/v1/ratio-acceptance/configs \
+  -H 'Content-Type: application/json' -d '{
+    "device_id": "ph-meter-01",
+    "numerator_metric": "sulfur_dioxide",
+    "denominator_metric": "exhaust_flow",
+    "numerator_unit": "mg",
+    "denominator_unit": "m3",
+    "ratio_lower_limit": 0.04,
+    "ratio_upper_limit": 0.06,
+    "min_valid_groups": 2
+  }'
+# => 201 {"id":1,"device_id":"ph-meter-01",
+#        "numerator_metric":"sulfur_dioxide","denominator_metric":"exhaust_flow",
+#        "numerator_unit":"mg","denominator_unit":"m3",
+#        "ratio_lower_limit":0.04,"ratio_upper_limit":0.06,
+#        "min_valid_groups":2,"created_at":"..."}
+```
+
+错误：两种指标相同、下限大于上限、最低有效组数小于 1 → `422`
+（请求模型与数据库 `CHECK` 约束双重保证）。同一设备可保存多套配置（例如不同
+指标对），查询时用 `config_id` 指定。
+
+配置查询：
+
+```bash
+curl 'localhost:8000/api/v1/ratio-acceptance/configs?device_id=ph-meter-01'
+curl localhost:8000/api/v1/ratio-acceptance/configs/1
+```
+
+### 执行验收
+
+`GET /api/v1/devices/{device_id}/ratio-acceptance/evaluate?from_seq=&to_seq=[&config_id=]`
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `from_seq` / `to_seq` | 是 | 包序号**闭区间** `[from_seq, to_seq]`，均 ≥ 1 且起点 ≤ 终点 |
+| `config_id` | 否 | 验收配置 id；该设备只有一套配置时可省略；多套配置时必须指定（否则 `422`） |
+
+配组与判定规则：
+
+- 只扫描区间内的**已提交包**（按 seq 升序）；缓冲包尚未提交、作废序号永久不在
+  `committed` 中，二者**都不参与计算**。区间内没有已提交包的序号（未到达 /
+  仍在缓冲 / 已作废）在响应 `absent_seqs` 中列出，仅作提示；
+- **包内一对一配组，禁止跨包**：在每个包内分别按两种指标在 `measurements`
+  中各自出现的顺序取读数，第 k 个分子读数与第 k 个分母读数配成一组；某一侧
+  条数更多时，多出的读数仍各成一组（因缺对应读数而无效），**不会去别的包
+  找补**；两种指标都不出现的包不产生组；
+- 无效原因（按优先级每组只记一个）：
+  `missing_numerator`（缺分子读数）/ `missing_denominator`（缺分母读数）/
+  `numerator_unit_mismatch`（分子单位不符，读数缺单位也算）/
+  `denominator_unit_mismatch`（分母单位不符）/
+  `denominator_zero`（分母为零）；`reason` 字段给出中文说明，单位不符时
+  附带实际值与要求值；
+- 有效组比例 `ratio = 分子读数 / 分母读数`，落在闭区间
+  `[ratio_lower_limit, ratio_upper_limit]` 内 `passed=true`（**恰等于上下限
+  也算合格**）；无效组 `ratio=null`、`passed=false`；
+- 整体 `accepted=true` 当且仅当 **有效组数 ≥ `min_valid_groups` 且全部有效组
+  都合格**；无效组不直接否决验收，但会拉低有效组数。
+
+```bash
+# 包内含两组分子/分母读数
+curl -X POST localhost:8000/api/v1/packages -H 'Content-Type: application/json' -d '{
+  "device_id": "ph-meter-01", "seq": 1, "idempotency_key": "k-1",
+  "measurements": [
+    {"metric": "sulfur_dioxide", "value": 0.5, "unit": "mg"},
+    {"metric": "exhaust_flow",   "value": 10.0, "unit": "m3"},
+    {"metric": "sulfur_dioxide", "value": 0.7, "unit": "mg"},
+    {"metric": "exhaust_flow",   "value": 10.0, "unit": "m3"}
+  ]
+}'
+
+curl 'localhost:8000/api/v1/devices/ph-meter-01/ratio-acceptance/evaluate?from_seq=1&to_seq=1'
+# => 200
+# {"config_id":1,"device_id":"ph-meter-01",
+#  "numerator_metric":"sulfur_dioxide","denominator_metric":"exhaust_flow",
+#  "numerator_unit":"mg","denominator_unit":"m3",
+#  "ratio_lower_limit":0.04,"ratio_upper_limit":0.06,"min_valid_groups":2,
+#  "from_seq":1,"to_seq":1,"scanned_package_count":1,
+#  "valid_group_count":2,"invalid_group_count":0,"passed_group_count":1,
+#  "accepted":false,"absent_seqs":[],
+#  "groups":[
+#    {"group_index":1,"seq":1,"numerator_position":0,"denominator_position":1,
+#     "numerator_value":0.5,"denominator_value":10.0,"ratio":0.05,
+#     "valid":true,"passed":true,"reason_code":null,"reason":null},
+#    {"group_index":2,"seq":1,"numerator_position":2,"denominator_position":3,
+#     "numerator_value":0.7,"denominator_value":10.0,"ratio":0.07,
+#     "valid":true,"passed":false,"reason_code":null,"reason":null}]}
+```
+
+无效组示例（同一包中单位不符、分母为零、缺对应读数会分别标注）：
+
+```json
+{"group_index":3,"seq":2,"numerator_position":0,"denominator_position":1,
+ "numerator_value":1.0,"denominator_value":0.0,"ratio":null,
+ "valid":false,"passed":false,
+ "reason_code":"denominator_zero","reason":"分母读数为零，无法计算比例"}
+```
+
+错误：未知设备 / 设备尚无配置 / `config_id` 不属于该设备 → `404`；
+`from_seq > to_seq`、序号小于 1、设备有多套配置却未给 `config_id` → `422`。
+
 ## 项目结构
 
 ```
@@ -597,6 +723,7 @@ app/
   rollup.py       # 窗口聚合：半开窗口分桶、水位迟到判定、可选校准值口径
   exports.py      # 只读归档导出：不可变快照、NDJSON 游标编解码、manifest 摘要校验（范围含作废段时 complete=false）
   comparisons.py  # 双设备同指标并行测量比对：候选时间排序、保序二分匹配（配对数>时间差总和>字典序）
+  ratio_acceptance.py # 双指标配比验收：包内按出现顺序一对一配组（禁跨包）、无效原因标注、闭区间比例判定
   db.py           # SQLite 连接与建表（启动时自动执行）
   schemas.py      # Pydantic 模型
 tests/
@@ -608,6 +735,7 @@ tests/
   test_calibrations.py  # 校准配置 / 解析 / 原始数据不变测试
   test_exports.py       # 归档导出 / 游标 / 摘要校验测试
   test_comparisons.py   # 双设备并行测量比对测试（排序 / 保序匹配 / 决胜 / 200 上限 / 只读）
+  test_ratio_acceptance.py # 双指标配比验收测试（配置校验 / 包内配组 / 无效原因 / 缓冲与作废不参与）
 Dockerfile / docker-entrypoint.sh / docker-compose.yml
 requirements.txt / requirements-dev.txt
 ```

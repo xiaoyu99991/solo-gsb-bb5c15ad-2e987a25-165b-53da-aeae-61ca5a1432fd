@@ -454,3 +454,117 @@ class ComparisonResponse(BaseModel):
     pairs: List[ComparisonPair] = Field(
         description="配对列表，按参考侧（两侧一致的）时间顺序排列"
     )
+
+
+# ---------------------------------------------------------------------------
+# 双指标配比验收
+# ---------------------------------------------------------------------------
+
+class RatioAcceptanceConfigCreate(BaseModel):
+    """为设备保存一套双指标配比验收配置。"""
+
+    device_id: str = Field(min_length=1)
+    numerator_metric: str = Field(min_length=1, description="分子指标名")
+    denominator_metric: str = Field(min_length=1, description="分母指标名，必须与分子指标不同")
+    numerator_unit: str = Field(min_length=1, description="分子读数要求的单位")
+    denominator_unit: str = Field(min_length=1, description="分母读数要求的单位")
+    ratio_lower_limit: float = Field(description="合格比例闭区间下限（含）")
+    ratio_upper_limit: float = Field(description="合格比例闭区间上限（含）")
+    min_valid_groups: int = Field(
+        default=1, ge=1, description="整体验收通过所需的最低有效组数"
+    )
+
+    @model_validator(mode="after")
+    def _check_config(self):
+        if self.numerator_metric == self.denominator_metric:
+            raise ValueError("分子指标与分母指标必须不同")
+        if self.ratio_lower_limit > self.ratio_upper_limit:
+            raise ValueError("ratio_lower_limit 不能大于 ratio_upper_limit")
+        return self
+
+
+class RatioAcceptanceConfigOut(BaseModel):
+    """一条双指标配比验收配置。"""
+
+    id: int
+    device_id: str
+    numerator_metric: str = Field(description="分子指标名")
+    denominator_metric: str = Field(description="分母指标名")
+    numerator_unit: str = Field(description="分子读数要求的单位")
+    denominator_unit: str = Field(description="分母读数要求的单位")
+    ratio_lower_limit: float = Field(description="合格比例闭区间下限（含）")
+    ratio_upper_limit: float = Field(description="合格比例闭区间上限（含）")
+    min_valid_groups: int = Field(description="整体验收通过所需的最低有效组数")
+    created_at: str
+
+
+class RatioAcceptanceConfigListResponse(BaseModel):
+    count: int
+    configs: List[RatioAcceptanceConfigOut]
+
+
+class RatioAcceptanceGroup(BaseModel):
+    """一组分子 / 分母配组的验收结论。"""
+
+    group_index: int = Field(description="逐组序号（从 1 起，按区间内处理顺序递增）")
+    seq: int = Field(description="本组所属已提交包序号")
+    numerator_position: Optional[int] = Field(
+        description="分子读数在该包 measurements 中的原始下标（从 0 起）；缺失时为 null"
+    )
+    denominator_position: Optional[int] = Field(
+        description="分母读数在该包 measurements 中的原始下标（从 0 起）；缺失时为 null"
+    )
+    numerator_value: Optional[float] = Field(
+        description="分子读数；缺失对应读数时为 null"
+    )
+    denominator_value: Optional[float] = Field(
+        description="分母读数；缺失对应读数时为 null"
+    )
+    ratio: Optional[float] = Field(
+        description="分子 / 分母比例；无效组不计算比例，为 null"
+    )
+    valid: bool = Field(description="该组是否有效（读数齐全、单位相符、分母非零）")
+    passed: bool = Field(
+        description="有效组比例是否落在闭区间内；无效组固定为 false"
+    )
+    reason_code: Optional[Literal[
+        "missing_numerator",
+        "missing_denominator",
+        "numerator_unit_mismatch",
+        "denominator_unit_mismatch",
+        "denominator_zero",
+    ]] = Field(description="无效原因代码；有效组为 null")
+    reason: Optional[str] = Field(description="无效原因中文说明；有效组为 null")
+
+
+class RatioAcceptanceResponse(BaseModel):
+    """闭区间内的双指标配比验收结果。"""
+
+    config_id: int
+    device_id: str
+    numerator_metric: str
+    denominator_metric: str
+    numerator_unit: str
+    denominator_unit: str
+    ratio_lower_limit: float
+    ratio_upper_limit: float
+    min_valid_groups: int
+    from_seq: int = Field(description="验收闭区间起点（含）")
+    to_seq: int = Field(description="验收闭区间终点（含）")
+    scanned_package_count: int = Field(
+        description="闭区间内实际扫描的已提交包数（缓冲包与作废序号不计）"
+    )
+    valid_group_count: int = Field(description="有效组数")
+    invalid_group_count: int = Field(description="无效组数")
+    passed_group_count: int = Field(
+        description="比例落在闭区间内的有效组数（合格组数）"
+    )
+    accepted: bool = Field(
+        description="整体是否验收通过：有效组数达到最低有效组数且全部有效组合格"
+    )
+    absent_seqs: List[int] = Field(
+        description="闭区间内没有已提交包的序号（未到达 / 仍在缓冲 / 已作废），不参与计算"
+    )
+    groups: List[RatioAcceptanceGroup] = Field(
+        description="逐组结论，按组序号升序；每组只在单个包内配成"
+    )

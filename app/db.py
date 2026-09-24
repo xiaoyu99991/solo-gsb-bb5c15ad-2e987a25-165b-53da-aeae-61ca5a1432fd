@@ -172,6 +172,29 @@ CREATE TABLE IF NOT EXISTS void_idempotency_keys (
     response_json TEXT NOT NULL,               -- 首次处理结果，重放时原样返回
     created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
+
+-- 双指标配比验收配置：每台设备可保存一套或多套分子 / 分母指标配比方案。
+-- 验收评估为纯只读：按包内两种指标各自出现顺序一对一配组（禁止跨包），
+-- 有效组比例（分子 / 分母）落在闭区间 [ratio_lower_limit, ratio_upper_limit]
+-- 内才算合格；整体须达到 min_valid_groups 个有效组且全部合格。
+CREATE TABLE IF NOT EXISTS ratio_acceptance_configs (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id          TEXT NOT NULL,
+    numerator_metric   TEXT NOT NULL,          -- 分子指标
+    denominator_metric TEXT NOT NULL,          -- 分母指标（必须与分子指标不同）
+    numerator_unit     TEXT NOT NULL,          -- 分子读数要求的单位
+    denominator_unit   TEXT NOT NULL,          -- 分母读数要求的单位
+    ratio_lower_limit  REAL NOT NULL,          -- 合格比例闭区间下限（含）
+    ratio_upper_limit  REAL NOT NULL,          -- 合格比例闭区间上限（含）
+    min_valid_groups   INTEGER NOT NULL DEFAULT 1,  -- 整体通过所需最低有效组数
+    created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    CHECK (numerator_metric <> denominator_metric),
+    CHECK (ratio_lower_limit <= ratio_upper_limit),
+    CHECK (min_valid_groups >= 1)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ratio_acceptance_configs_device
+    ON ratio_acceptance_configs (device_id, id);
 """
 
 
