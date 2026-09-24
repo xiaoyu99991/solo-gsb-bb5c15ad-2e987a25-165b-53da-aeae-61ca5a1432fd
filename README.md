@@ -11,6 +11,7 @@
 - **设备指标校准**：按设备 + 指标维护线性校准配置（`校准值 = 原始值 × scale + offset`），有效时间段互不重叠（事务内校验），按时刻解析唯一生效配置并计算校准值，不改写已存原始测量；窗口聚合支持可选的校准值模式（`calibrated=true`），按每个已提交包的 `sent_at` 解析当时生效的校准区间计算统计值，无配置沿用原始值。
 - **只读归档导出**：按设备 + seq 范围创建一次性导出任务，返回 NDJSON 分页游标与 manifest（包数、首尾序号、规范化内容 SHA-256），快照不可变、续传字节稳定，并提供摘要校验接口；导出不触碰提交、缓冲、重复与告警数据。
 - **双设备并行测量比对**：交接班时按设备、指标、UTC 时间段、最大时间偏差与允许数值偏差，只读比对参考仪器与待检仪器已提交包中的同指标读数；测量时间优先取 `ts`、否则取包 `sent_at`，保序一对一配对（先最大化配对数、再最小化时间差总和、平局按配对序号字典序决胜），返回逐对读数差与是否超差及两侧未配对汇总；不改写原始包、缓冲与告警。
+- **双指标配比验收**：为每台设备保存分子 / 分母指标、各自单位、合格比例闭区间与最低有效组数（指标必须不同、下限不大于上限）；按设备 + 序号**闭区间**只读验收已提交包——每个包内两种指标按各自出现顺序**一对一配组、禁止跨包**，缺对应读数、单位不符或分母为零的组标无效并说明原因，有效组比例落在闭区间内才合格；整体须达到最低有效组数且所有有效组合格，返回逐组序号、包内位置、比例与结论；缓冲包与作废序号不参与计算。
 
 ## 快速开始
 
@@ -21,7 +22,7 @@ docker compose up --build
 ```
 
 这一条命令完成全部初始化：构建镜像 → 容器内安装依赖（`docker-entrypoint.sh`）→
-应用启动钩子自动创建 SQLite 数据库与全部表结构（含告警规则、规则状态、告警事件、校准配置表）→ 启动服务。
+应用启动钩子自动创建 SQLite 数据库与全部表结构（含告警规则、规则状态、告警事件、校准配置与双指标配比验收配置表）→ 启动服务。
 数据库文件持久化在命名卷 `lab-data`（容器内 `/data/lab.db`），重启不丢规则与事件。
 
 服务地址：http://localhost:8000 ，交互式文档：http://localhost:8000/docs
@@ -104,6 +105,10 @@ pytest tests/
 | GET | `/api/v1/exports/{id}/pages?cursor=` | NDJSON 分页续传（响应头返回下一个游标） |
 | POST | `/api/v1/exports/{id}/verify` | 提交导出内容 SHA-256 校验完整性 |
 | GET | `/api/v1/comparisons` | 双设备同指标并行测量比对（交接班核对参考 / 待检仪器读数） |
+| POST | `/api/v1/ratio-acceptances` | 为设备保存双指标配比验收配置（每台设备至多一条；指标须不同、下限不大于上限） |
+| GET | `/api/v1/ratio-acceptances` | 配比验收配置列表（可按 `device_id` 过滤） |
+| GET | `/api/v1/devices/{id}/ratio-acceptance` | 查询单台设备的配比验收配置 |
+| GET | `/api/v1/devices/{id}/ratio-acceptance/evaluate?from_seq=&to_seq=` | 按设备 + 序号闭区间执行双指标配比验收（只读，逐组返回结论） |
 
 ## 窗口聚合（Rollup）
 
@@ -585,6 +590,105 @@ curl 'localhost:8000/api/v1/comparisons?reference_device=ph-ref-01&target_device
 #       "time_delta_seconds":2.0,"abs_value_diff":0.3,"exceeded":false}, ...]}
 ```
 
+## 双指标配比验收（Ratio Acceptance）
+
+对一台设备保存一组验收配置，随后按**序号闭区间**对已提交包做只读验收。
+例如用「加标回收率 = 检出量 / 加入量」核对：两种指标在同一个测量包内
+成对上报，逐包一对一配组并检查比例是否落在允许区间。接口是纯只读的，
+不写入任何数据，也不改写原始包、缓冲、重复、作废、告警与校准。
+
+### 保存配置
+
+`POST /api/v1/ratio-acceptances`（每台设备至多一条，重复配置返回 `409`）
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `device_id` | 是 | 设备号 |
+| `numerator_metric` / `denominator_metric` | 是 | 分子指标名 / 分母指标名，**二者必须不同** |
+| `numerator_unit` / `denominator_unit` | 是 | 分子 / 分母读数要求的单位（非空字符串，读数单位须逐字相同；读数缺单位视为不符） |
+| `ratio_lower` / `ratio_upper` | 是 | 合格比例闭区间下限（含）/ 上限（含），**下限不得大于上限**（相等表示单点区间） |
+| `min_valid_groups` | 是 | 整体验收要求达到的最低有效组数，`>= 1` |
+
+```bash
+curl -X POST localhost:8000/api/v1/ratio-acceptances -H 'Content-Type: application/json' -d '{
+  "device_id": "ph-meter-01",
+  "numerator_metric": "recovered", "denominator_metric": "added",
+  "numerator_unit": "mg", "denominator_unit": "mg",
+  "ratio_lower": 0.9, "ratio_upper": 1.1, "min_valid_groups": 3
+}'
+# => 201 {"id":1,"device_id":"ph-meter-01",
+#        "numerator_metric":"recovered","denominator_metric":"added",
+#        "numerator_unit":"mg","denominator_unit":"mg",
+#        "ratio_lower":0.9,"ratio_upper":1.1,"min_valid_groups":3,
+#        "created_at":"...","updated_at":"..."}
+```
+
+校验错误（两指标相同、下限大于上限、`min_valid_groups < 1`、缺单位）→ `422`。
+查询配置：`GET /api/v1/ratio-acceptances`（可加 `?device_id=` 过滤）、
+`GET /api/v1/devices/{id}/ratio-acceptance`（未配置 `404`）。
+
+### 按序号闭区间验收
+
+`GET /api/v1/devices/{device_id}/ratio-acceptance/evaluate?from_seq=&to_seq=`
+
+两个参数均必填、`>= 1`，区间为**闭区间 `[from_seq, to_seq]`**（两端都含）。
+计算规则：
+
+- **只读取已提交包**：区间内按 seq 升序扫描 `committed` 真实包；仍在缓冲区
+  的包不参与，作废序号本就不在 committed 中、也不参与（例如区间含作废段时
+  结果里不会出现那些序号）；
+- **包内一对一配组、禁止跨包**：在每个包内分别按 `measurements` 的出现顺序
+  收集分子指标与分母指标的读数（保留各自原始下标），两侧第 0、1、2… 个
+  读数配成第 0、1、2… 组；某一侧读数更多时，残余读数各自成组（不与下一个包
+  的读数配组）；逐组序号 `index` 从 1 起，按包序号与包内位置**跨包连续**编号；
+- **无效组**（不参与比例合格判定，但拉低有效组数）按以下优先级取首个原因：
+  - `missing_numerator` / `missing_denominator`：该组缺少对应一侧读数
+    （含"另一包多出一个读数"的残余情况），`invalid_reason_detail` 说明包序号
+    与包内组号；
+  - `unit_mismatch`：分子或分母读数单位与配置要求不符（**读数未填单位同样
+    视为不符**），说明文字给出是哪一侧、实际单位与要求单位；
+  - `zero_denominator`：分母读数为零，比例不可计算；
+- **有效组**比例 = 分子读数 / 分母读数，闭区间判定：
+  `ratio_lower <= ratio <= ratio_upper`（**边界合格**），在区间内结论
+  `pass`，否则 `fail`；
+- **整体结论** `accepted=true` 当且仅当
+  `有效组数 >= min_valid_groups` **且** 不存在 `fail` 的有效组；
+  否则 `accepted=false` 并在 `not_accepted_reason` 说明（比例超界给出组序号
+  与区间，或有效组数不足给出实际数与要求数）。
+
+```bash
+curl 'localhost:8000/api/v1/devices/ph-meter-01/ratio-acceptance/evaluate?from_seq=1&to_seq=10'
+# => 200
+# {"device_id":"ph-meter-01","from_seq":1,"to_seq":10,
+#  "config":{ ... 回显本次使用的配置 ... },
+#  "package_count":4,"group_count":4,
+#  "valid_group_count":3,"invalid_group_count":1,"failed_group_count":0,
+#  "accepted":true,"not_accepted_reason":null,
+#  "groups":[
+#    {"index":1,"seq":1,"position":0,
+#     "numerator":{"seq":1,"position":1,"value":9.5,"unit":"mg","unit_matches":true},
+#     "denominator":{"seq":1,"position":0,"value":10.0,"unit":"mg","unit_matches":true},
+#     "valid":true,"invalid_reason":null,"invalid_reason_detail":null,
+#     "ratio":0.95,"conclusion":"pass"},
+#    {"index":2,"seq":2,"position":0,
+#     "numerator":{...,"value":12.0,...},"denominator":{...,"value":10.0,...},
+#     "valid":true,"invalid_reason":null,"ratio":1.2,"conclusion":"fail"},
+#    {"index":3,"seq":3,"position":0,
+#     "numerator":null,
+#     "denominator":{"seq":3,"position":0,"value":10.0,"unit":"mg","unit_matches":true},
+#     "valid":false,"invalid_reason":"missing_numerator",
+#     "invalid_reason_detail":"包 3 的第 1 组缺少分子指标读数，无法配组",
+#     "ratio":null,"conclusion":"invalid"},
+#    {"index":4,"seq":4,"position":0, ... "invalid_reason":"zero_denominator", ...}
+#  ]}
+```
+
+说明：`position` 是该组在**所属包内**的组序号（两种指标各自序列中的下标，
+从 0 起）；`numerator` / `denominator` 内的 `position` 是读数在包
+`measurements` 中的原始下标；无效组与分母为零的组 `ratio` 为 `null`。
+未知设备或设备尚无配置 → `404`；区间倒置 / 序号小于 1 → `422`；
+区间内没有任何组时 HTTP 仍为 `200`，`accepted=false`（有效组数 0 未达最低要求）。
+
 ## 项目结构
 
 ```
@@ -597,6 +701,7 @@ app/
   rollup.py       # 窗口聚合：半开窗口分桶、水位迟到判定、可选校准值口径
   exports.py      # 只读归档导出：不可变快照、NDJSON 游标编解码、manifest 摘要校验（范围含作废段时 complete=false）
   comparisons.py  # 双设备同指标并行测量比对：候选时间排序、保序二分匹配（配对数>时间差总和>字典序）
+  ratio_acceptance.py # 双指标配比验收：配置表、包内一对一配组（禁跨包）、无效原因与闭区间合格判定
   db.py           # SQLite 连接与建表（启动时自动执行）
   schemas.py      # Pydantic 模型
 tests/
@@ -608,6 +713,7 @@ tests/
   test_calibrations.py  # 校准配置 / 解析 / 原始数据不变测试
   test_exports.py       # 归档导出 / 游标 / 摘要校验测试
   test_comparisons.py   # 双设备并行测量比对测试（排序 / 保序匹配 / 决胜 / 200 上限 / 只读）
+  test_ratio_acceptance.py # 双指标配比验收测试（配置校验 / 包内配组 / 无效原因 / 闭区间 / 缓冲作废排除 / 只读）
 Dockerfile / docker-entrypoint.sh / docker-compose.yml
 requirements.txt / requirements-dev.txt
 ```

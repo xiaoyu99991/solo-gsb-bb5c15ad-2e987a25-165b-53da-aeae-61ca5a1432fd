@@ -26,6 +26,15 @@ from . import exports
 from .comparisons import ComparisonError, compare_devices
 from .exports import ExportError, InvalidCursor
 from .logic import IdempotencyConflict, ingest_package
+from .ratio_acceptance import (
+    RatioAcceptanceConflict,
+    RatioAcceptanceError,
+    RatioAcceptanceNotFound,
+    create_acceptance,
+    evaluate as evaluate_ratio,
+    get_acceptance,
+    list_acceptances,
+)
 from .rollup import RollupError, compute_rollup
 from .schemas import (
     AlertEventsResponse,
@@ -48,6 +57,9 @@ from .schemas import (
     GapsResponse,
     IngestResponse,
     PackageIn,
+    RatioAcceptanceCreate,
+    RatioAcceptanceOut,
+    RatioAcceptanceResponse,
     RollupResponse,
     RuleCreate,
     RuleListResponse,
@@ -389,6 +401,106 @@ def get_comparison(
                 allowed_value_diff,
             )
         except ComparisonError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# 双指标配比验收
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/api/v1/ratio-acceptances",
+    response_model=RatioAcceptanceOut,
+    status_code=201,
+)
+def post_ratio_acceptance(cfg_in: RatioAcceptanceCreate):
+    """为设备保存双指标配比验收配置（每台设备至多一条）。
+
+    分子指标与分母指标必须不同，ratio_lower 不得大于 ratio_upper，
+    min_valid_groups 至少为 1；重复配置返回 409。
+    """
+    with db.ingest_lock, db.get_conn() as conn:
+        try:
+            cfg_id = create_acceptance(
+                conn,
+                cfg_in.device_id,
+                cfg_in.numerator_metric,
+                cfg_in.denominator_metric,
+                cfg_in.numerator_unit,
+                cfg_in.denominator_unit,
+                cfg_in.ratio_lower,
+                cfg_in.ratio_upper,
+                cfg_in.min_valid_groups,
+            )
+        except RatioAcceptanceConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except RatioAcceptanceError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        row = conn.execute(
+            "SELECT * FROM ratio_acceptances WHERE id = ?", (cfg_id,)
+        ).fetchone()
+        return RatioAcceptanceOut(**dict(row))
+
+
+@app.get("/api/v1/ratio-acceptances", response_model=List[RatioAcceptanceOut])
+def list_ratio_acceptances(
+    device_id: Optional[str] = Query(default=None, description="按设备过滤"),
+):
+    """列出双指标配比验收配置（可按设备过滤）。"""
+    with db.get_conn() as conn:
+        if device_id is not None:
+            rows = conn.execute(
+                "SELECT * FROM ratio_acceptances WHERE device_id = ? ORDER BY id",
+                (device_id,),
+            ).fetchall()
+        else:
+            rows = list_acceptances(conn)
+    return [RatioAcceptanceOut(**dict(r)) for r in rows]
+
+
+@app.get(
+    "/api/v1/devices/{device_id}/ratio-acceptance",
+    response_model=RatioAcceptanceOut,
+)
+def get_device_ratio_acceptance(device_id: str):
+    """查询单台设备的双指标配比验收配置；未配置返回 404。"""
+    with db.get_conn() as conn:
+        row = get_acceptance(conn, device_id)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"设备 {device_id} 尚无可用双指标配比验收配置",
+        )
+    return RatioAcceptanceOut(**dict(row))
+
+
+@app.get(
+    "/api/v1/devices/{device_id}/ratio-acceptance/evaluate",
+    response_model=RatioAcceptanceResponse,
+)
+def get_device_ratio_acceptance_result(
+    device_id: str,
+    from_seq: int = Query(ge=1, description="验收闭区间起点（含）"),
+    to_seq: int = Query(ge=1, description="验收闭区间终点（含）"),
+):
+    """按设备 + seq 闭区间执行双指标配比验收（纯只读）。
+
+    仅读取已提交包：在每个包内按分子 / 分母指标各自出现顺序一对一
+    配组，禁止跨包；缺少对应读数、单位不符或分母为零的组标为无效并
+    说明原因；有效组比例落在配置闭区间内才合格，整体须达到最低有效
+    组数且所有有效组合格。缓冲包与作废序号不参与计算。
+    """
+    with db.get_conn() as conn:
+        dev = conn.execute(
+            "SELECT 1 FROM devices WHERE device_id = ?", (device_id,)
+        ).fetchone()
+        if dev is None:
+            raise HTTPException(status_code=404, detail=f"未知设备: {device_id}")
+        try:
+            return evaluate_ratio(conn, device_id, from_seq, to_seq)
+        except RatioAcceptanceNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except RatioAcceptanceError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 

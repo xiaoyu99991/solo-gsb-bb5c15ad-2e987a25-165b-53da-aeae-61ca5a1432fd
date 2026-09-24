@@ -172,6 +172,29 @@ CREATE TABLE IF NOT EXISTS void_idempotency_keys (
     response_json TEXT NOT NULL,               -- 首次处理结果，重放时原样返回
     created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
+
+-- 双指标配比验收配置：每台设备至多一条。验收时在每个已提交包内把分子指标
+-- 与分母指标的读数按各自出现顺序一对一配组（禁止跨包），组内单位不符、
+-- 分母为零或缺少对应读数的组无效；有效组比例须落在 [ratio_lower,
+-- ratio_upper] 闭区间内，整体有效组数还须达到 min_valid_groups。
+CREATE TABLE IF NOT EXISTS ratio_acceptances (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id          TEXT NOT NULL UNIQUE,
+    numerator_metric   TEXT NOT NULL,            -- 分子指标名（必须与分母指标不同）
+    denominator_metric TEXT NOT NULL,            -- 分母指标名
+    numerator_unit     TEXT NOT NULL,            -- 分子读数要求的单位
+    denominator_unit   TEXT NOT NULL,            -- 分母读数要求的单位
+    ratio_lower        REAL NOT NULL,            -- 合格比例下限（含）
+    ratio_upper        REAL NOT NULL,            -- 合格比例上限（含）
+    min_valid_groups   INTEGER NOT NULL,         -- 整体验收要求的最低有效组数
+    created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    CHECK (length(numerator_metric) >= 1 AND length(denominator_metric) >= 1),
+    CHECK (numerator_metric <> denominator_metric),
+    CHECK (length(numerator_unit) >= 1 AND length(denominator_unit) >= 1),
+    CHECK (ratio_lower <= ratio_upper),
+    CHECK (min_valid_groups >= 1)
+);
 """
 
 
